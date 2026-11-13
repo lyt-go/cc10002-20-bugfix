@@ -75,5 +75,21 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 同步通道 × 变更审计联动规则
+
+- 通道状态机：`草稿 → 通道审批中 → 已启用 → 已停用`，每次只能单向走一步；
+  草稿不能直接启用，已停用为终态，不能跳过审批重新启用。
+- 启用/停用与审计回写在同一事务（`store.transaction()`）里完成，要么一起成功
+  要么一起退回；审计只增不改，后续流转追加新条目，历史审计保持原值。
+- 联动审计保留 `transition_id`、`before_state`、`after_state`、`operator`、
+  `reason`、`source_version`、`recorded_at`，前后值来自同一次事务快照。
+- 行级 `version` 做乐观并发仲裁：并发启停同一通道时只接受一次有效结果，
+  携带过期 `expected_version` 的请求整体退回（返回 `conflict: true`）。
+- 审计自身状态机：`草稿 → 已记录 → 已复核`；变更前后值相同不能确认，
+  重复执行同一动作不会生成重复记录。
+- 导出按「模块 + 过滤条件 + 数据内容」做指纹去重，结果带文件清单与下载时间；
+  相同内容重复导出复用同一份结果并累计下载次数。
+- 回归测试：`cd backend && .venv/bin/python -m unittest discover -s tests -v`。
+
 领域：数据工程
 子方向：数仓与数据湖

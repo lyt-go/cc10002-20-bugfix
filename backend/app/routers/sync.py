@@ -1,12 +1,17 @@
-"""同步通道接口：维护同步通道，覆盖提交通道审批、启用通道、停用通道等动作。"""
+"""同步通道接口：维护同步通道，覆盖提交通道审批、启用通道、停用通道等动作。
+
+注意路由声明顺序：``/export`` 必须在 ``/{entry_id}`` 之前，否则 FastAPI 会把
+``export`` 当成通道 id 匹配，导出入口直接 422 失败。
+"""
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.sync import SyncService
+from app.services.export_registry import export_registry
+from app.services.sync import SyncConflictError, SyncService
 
 router = APIRouter(prefix="/api/sync", tags=["同步通道"])
 
@@ -16,18 +21,51 @@ LIST_FIELDS = ["通道编号", "来源表名", "目标表名", "同步方式", "
 STATUSES = ["草稿", "通道审批中", "已启用", "已停用"]
 
 
+def _extract_values(payload: EntryPayload, request: Request) -> dict[str, Any]:
+    """兼容两种动作报文：规范的 {values: {...}} 和前端历史的扁平 {action: ...}。"""
+    values = dict(payload.values or {})
+    if not values:
+        body = getattr(request.state, "raw_body", None)
+        if isinstance(body, dict):
+            values.update({k: v for k, v in body.items() if k not in {"values", "remark"}})
+    return values
+
+
 @router.get("", response_model=PageResult[dict])
 def list_entries(
+    request: Request,
     keyword: str | None = Query(default=None, description="按通道编号检索"),
     status: str | None = Query(default=None, description="草稿、通道审批中、已启用、已停用"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按通道编号与状态过滤同步通道列表；没有数据时返回空页，不报错。"""
+    """按通道编号、状态与列表字段过滤同步通道；列表与详情取同一事务快照口径。"""
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    filters: dict[str, Any] = {}
+    for field in LIST_FIELDS:
+        if field in request.query_params:
+            filters[field] = request.query_params[field]
+    items, total = service.list_entries(
+        keyword=keyword, status=status, filters=filters, page=page, size=size
+    )
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/export")
+def export_entries(request: Request) -> dict[str, Any]:
+    """导出同步通道清单：带文件清单与下载时间，相同内容重复导出只生成一份结果。"""
+    filters = {field: request.query_params[field] for field in LIST_FIELDS if field in request.query_params}
+    status = request.query_params.get("status")
+    keyword = request.query_params.get("keyword")
+
+    def _load() -> list[dict[str, Any]]:
+        items, _ = service.list_entries(
+            keyword=keyword, status=status, filters=filters, page=1, size=10000
+        )
+        return items
+
+    return export_registry.export("sync", {"keyword": keyword, "status": status, **filters}, _load)
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -49,17 +87,30 @@ def create_entry(payload: EntryPayload) -> ActionResult:
 
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
-def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条同步通道执行提交通道审批、启用通道、停用通道；不允许的动作会被拦下并说明原因。"""
-    action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
+def run_action(entry_id: int, payload: EntryPayload, request: Request) -> ActionResult:
+    """对单条同步通道执行单向流转；非法跳转、并发冲突都会被拦下并说明原因。"""
+    values = _extract_values(payload, request)
+    action = str(values.get("action") or "").strip()
+    operator = values.get("operator")
+    reason = values.get("reason")
+    raw_version = values.get("expected_version")
+    if raw_version is not None:
+        try:
+            expected_version: int | None = int(raw_version)
+        except (TypeError, ValueError):
+            return ActionResult(ok=False, message="expected_version 必须是整数版本号")
+    else:
+        expected_version = None
+    try:
+        entry, audit, message = service.run_action(
+            entry_id,
+            action,
+            operator=operator,
+            reason=reason,
+            expected_version=int(expected_version) if expected_version is not None else None,
+        )
+    except SyncConflictError as exc:
+        return ActionResult(ok=False, conflict=True, message=str(exc))
     if entry is None:
         return ActionResult(ok=False, message=message)
-    return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出同步通道清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "sync", "total": total, "items": items}
+    return ActionResult(ok=True, message=message, entry=entry, audit=audit)

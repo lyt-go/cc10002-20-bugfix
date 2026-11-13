@@ -19,6 +19,9 @@ class ActionResult(BaseModel):
     ok: bool
     message: str
     entry: dict[str, Any] | None = None
+    # 同步通道联动生成的变更审计快照；冲突时置位让前端提示刷新重试。
+    audit: dict[str, Any] | None = None
+    conflict: bool = False
 
 
 class EntryPayload(BaseModel):

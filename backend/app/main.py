@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
-from fastapi import FastAPI
+import json
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
@@ -21,6 +23,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def attach_raw_body(request: Request, call_next):  # type: ignore[no-untyped-def]
+    """保留原始 JSON 报文，兼容前端历史上扁平提交的 {action: ...} 动作请求。
+
+    请求体只能读一次，这里读完后用闭包重放给下游 Pydantic 解析。
+    """
+    if request.method in {"POST", "PUT", "PATCH"} and "application/json" in request.headers.get(
+        "content-type", ""
+    ):
+        raw = await request.body()
+        if raw:
+            try:
+                request.state.raw_body = json.loads(raw)
+            except json.JSONDecodeError:
+                request.state.raw_body = None
+
+            async def receive() -> dict[str, object]:
+                return {"type": "http.request", "body": raw, "more_body": False}
+
+            request = Request(request.scope, receive)
+    return await call_next(request)
 
 for module in ROUTERS:
     app.include_router(module.router)
